@@ -4,36 +4,30 @@ import json
 import logging
 import base64
 import pathlib
-from datetime import datetime, date
+from datetime import date
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    filters, ContextTypes,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, ContextTypes,
 )
 
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1 import SERVER_TIMESTAMP
-from google.cloud.firestore_v1.base_query import FieldFilter
 
-# ── LOGGING ──────────────────────────────────────────────
+# ── LOGGING ───────────────────────────────────────────────
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ── FIREBASE INIT ─────────────────────────────────────────
-# На Railway передаём сервисный аккаунт через переменную окружения
-# FIREBASE_CREDENTIALS = base64 от содержимого serviceAccount.json
+# ── FIREBASE ──────────────────────────────────────────────
 _raw = os.environ.get('FIREBASE_CREDENTIALS', '')
 if _raw:
-    _decoded = base64.b64decode(_raw).decode('utf-8')
-    _cred_dict = json.loads(_decoded)
-    cred = credentials.Certificate(_cred_dict)
+    cred = credentials.Certificate(json.loads(base64.b64decode(_raw).decode()))
 else:
-    # Локальная разработка — файл рядом с bot.py
     cred = credentials.Certificate('serviceAccount.json')
 
 firebase_admin.initialize_app(cred)
@@ -42,404 +36,459 @@ db = firestore.client()
 BOT_TOKEN = os.environ['BOT_TOKEN']
 
 # ── USER STORAGE ──────────────────────────────────────────
-# Хранит telegram_id → firebase_uid
 USERS_FILE = 'users.json'
 
 def load_users() -> dict:
     p = pathlib.Path(USERS_FILE)
-    if p.exists():
-        return json.loads(p.read_text(encoding='utf-8'))
-    return {}
+    return json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
 
 def save_users(users: dict):
     pathlib.Path(USERS_FILE).write_text(
         json.dumps(users, ensure_ascii=False, indent=2), encoding='utf-8'
     )
 
-# ── CATEGORY DETECTION ───────────────────────────────────
-EXP_KEYWORDS = {
-    'Еда':          {'еда','кофе','ресторан','кафе','обед','ужин','завтрак',
-                     'продукты','супермаркет','пицца','суши','бургер','фаст'},
-    'Транспорт':    {'такси','метро','автобус','транспорт','бензин','парковка',
-                     'uber','яндекс','маршрутка','поезд','билет'},
-    'Жильё':        {'аренда','квартира','жильё','коммунальные','ком','свет',
-                     'вода','газ','квплата'},
-    'Здоровье':     {'аптека','врач','здоровье','лекарство','клиника','больница',
-                     'таблетки','анализы'},
-    'Развлечения':  {'кино','театр','развлечения','концерт','игры','подписка',
-                     'netflix','spotify','книга','спорт'},
-    'Одежда':       {'одежда','обувь','шопинг','покупки'},
-    'Связь':        {'телефон','связь','интернет','мтс','билайн','мегафон','симка'},
-    'Кредит':       {'кредит','ипотека','займ','долг','рассрочка'},
-}
-EXP_EMOJIS = {
-    'Еда':'🍕','Транспорт':'🚗','Жильё':'🏠','Здоровье':'💊',
-    'Развлечения':'🎬','Одежда':'👗','Связь':'📱','Кредит':'🏦','Другое':'💡',
-}
-INC_KEYWORDS = {
-    'Зарплата':   {'зарплата','salary','оклад'},
-    'Фриланс':    {'фриланс','проект','заказ','работа'},
-    'Подарок':    {'подарок','gift'},
-    'Инвестиции': {'инвестиции','дивиденды','акции','вклад','процент'},
-}
-INC_EMOJIS = {
-    'Зарплата':'💼','Фриланс':'💻','Подарок':'🎁','Инвестиции':'📈','Другое':'💡',
-}
-
-def detect_category(desc: str, tx_type: str) -> tuple[str, str]:
-    dl = desc.lower()
-    if tx_type == 'expense':
-        for cat, kws in EXP_KEYWORDS.items():
-            if any(kw in dl for kw in kws):
-                return cat, EXP_EMOJIS[cat]
-        return 'Другое', '💡'
-    else:
-        for cat, kws in INC_KEYWORDS.items():
-            if any(kw in dl for kw in kws):
-                return cat, INC_EMOJIS[cat]
-        return 'Другое', '💡'
-
-# ── HELPERS ───────────────────────────────────────────────
-def fmt(amount: float) -> str:
-    """1500.5 → '1 500,50 ⃀'"""
-    s = f"{amount:,.2f}".replace(',', ' ').replace('.', ',')
-    return f"{s} ⃀"
-
 def get_uid(tg_id: str) -> str | None:
     return load_users().get(tg_id)
 
-def require_uid(uid) -> bool:
-    return uid is not None
+# ── CONVERSATION STATES ───────────────────────────────────
+ENTER_AMOUNT, CHOOSE_CATEGORY, ENTER_CUSTOM_CAT = range(3)
 
-HELP_TEXT = (
-    "📝 *Команды бота:*\n\n"
-    "*Добавить запись:*\n"
-    "`расход 500 кофе` — расход\n"
-    "`доход 50000 зарплата` — доход\n"
-    "`-500 такси` или `+5000 фриланс` — быстрый ввод\n\n"
-    "*Просмотр:*\n"
-    "/balance — текущий баланс\n"
-    "/stat — топ расходов за месяц\n"
-    "/last — последние 5 записей\n\n"
-    "*Управление:*\n"
-    "/delete — удалить последнюю запись\n"
-    "/disconnect — отвязать Firebase аккаунт\n"
-    "/help — эта справка"
-)
+# ── CATEGORIES ────────────────────────────────────────────
+EXPENSE_CATS = [
+    ('🍕 Еда',         'Еда',         '🍕'),
+    ('🚗 Транспорт',   'Транспорт',   '🚗'),
+    ('🏠 Жильё',       'Жильё',       '🏠'),
+    ('💊 Здоровье',    'Здоровье',    '💊'),
+    ('🎬 Развлечения', 'Развлечения', '🎬'),
+    ('👗 Одежда',      'Одежда',      '👗'),
+    ('📱 Связь',       'Связь',       '📱'),
+    ('🏦 Кредит',      'Кредит',      '🏦'),
+    ('💡 Другое',      'Другое',      '💡'),
+]
+INCOME_CATS = [
+    ('💼 Зарплата',    'Зарплата',    '💼'),
+    ('💻 Фриланс',     'Фриланс',     '💻'),
+    ('🎁 Подарок',     'Подарок',     '🎁'),
+    ('📈 Инвестиции',  'Инвестиции',  '📈'),
+    ('💡 Другое',      'Другое',      '💡'),
+]
 
-# ── HANDLERS ──────────────────────────────────────────────
+def fmt(amount: float) -> str:
+    s = f"{amount:,.2f}".replace(',', ' ').replace('.', ',')
+    return f"{s} ⃀"
+
+def cat_keyboard(tx_type: str) -> InlineKeyboardMarkup:
+    cats = EXPENSE_CATS if tx_type == 'expense' else INCOME_CATS
+    rows, row = [], []
+    for label, name, _ in cats:
+        row.append(InlineKeyboardButton(label, callback_data=f"cat:{name}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Своя категория", callback_data="cat:__custom__")])
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📉 Расход", callback_data="type:expense"),
+            InlineKeyboardButton("📈 Доход",  callback_data="type:income"),
+        ],
+        [
+            InlineKeyboardButton("💳 Баланс",     callback_data="menu:balance"),
+            InlineKeyboardButton("📊 Статистика", callback_data="menu:stat"),
+        ],
+        [
+            InlineKeyboardButton("🕓 Последние",     callback_data="menu:last"),
+            InlineKeyboardButton("🗑 Удалить посл.", callback_data="menu:delete"),
+        ],
+    ])
+
+# ── /start ────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    uid = get_uid(tg_id)
+    name  = update.effective_user.first_name or "друг"
 
-    if uid:
+    if not get_uid(tg_id):
         await update.message.reply_text(
-            f"👋 С возвращением!\n\n{HELP_TEXT}",
+            f"👋 Привет, *{name}*!\n\n"
+            "Я помогу управлять *личными финансами* прямо из Telegram — "
+            "записи мгновенно синхронизируются с твоим веб-приложением.\n\n"
+            "🔑 Чтобы начать:\n"
+            "1. Открой сайт → *Меню → Настройки*\n"
+            "2. Скопируй свой *Firebase UID*\n"
+            "3. Отправь мне: `/uid ТВОЙ_UID`",
             parse_mode='Markdown'
         )
-    else:
-        await update.message.reply_text(
-            "👋 Привет! Я помогу управлять *личными финансами* прямо из Telegram.\n\n"
-            "Данные хранятся в твоём Firebase и синхронизируются с веб-приложением в реальном времени.\n\n"
-            "🔑 *Шаг 1:* Открой сайт с финансами\n"
-            "🔑 *Шаг 2:* Зайди в *Меню → Мой UID* и скопируй ID\n"
-            "🔑 *Шаг 3:* Отправь мне:\n"
-            "`/uid ТВОЙ_UID`",
-            parse_mode='Markdown'
-        )
+        return
 
+    await update.message.reply_text(
+        f"👋 Привет, *{name}*! Что делаем?",
+        parse_mode='Markdown',
+        reply_markup=main_keyboard()
+    )
+
+# ── /uid ──────────────────────────────────────────────────
 async def cmd_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-
     if not context.args:
-        await update.message.reply_text(
-            "Использование: `/uid ТВОЙ_FIREBASE_UID`", parse_mode='Markdown'
-        )
+        await update.message.reply_text("Использование: `/uid ТВОЙ_FIREBASE_UID`", parse_mode='Markdown')
         return
-
     uid = context.args[0].strip()
+    users = load_users()
+    users[tg_id] = uid
+    save_users(users)
+    name = update.effective_user.first_name or "друг"
+    await update.message.reply_text(
+        f"✅ *Аккаунт подключён!* Привет, *{name}*!\n\nЧто делаем?",
+        parse_mode='Markdown',
+        reply_markup=main_keyboard()
+    )
 
-    # Проверяем что такой пользователь существует в Firestore
-    try:
-        doc = db.collection('users').document(uid).get()
-        # Даже если документа нет — UID всё равно валидный (новый юзер)
-        users = load_users()
-        users[tg_id] = uid
-        save_users(users)
-        await update.message.reply_text(
-            "✅ *Аккаунт подключён!*\n\n"
-            "Теперь можешь добавлять записи:\n"
-            "`расход 500 кофе`\n"
-            "`доход 50000 зарплата`\n\n"
-            "Или нажми /помощь для списка команд.",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка подключения: {e}")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode='Markdown')
-
-
-async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
-    uid = get_uid(tg_id)
-    if not uid:
+    if not get_uid(tg_id):
         await update.message.reply_text("⚠️ Сначала подключи аккаунт: /start")
         return
+    await update.message.reply_text("Что делаем?", reply_markup=main_keyboard())
+
+# ── CONVERSATION: выбор типа (entry point) ────────────────
+async def cb_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    tg_id = str(query.from_user.id)
+    if not get_uid(tg_id):
+        await query.edit_message_text("⚠️ Аккаунт не подключён. /start")
+        return ConversationHandler.END
+
+    tx_type = query.data.split(':')[1]
+    context.user_data['tx_type'] = tx_type
+    type_label = "📉 Расход" if tx_type == 'expense' else "📈 Доход"
+
+    await query.edit_message_text(
+        f"*{type_label}*\n\n💰 Введи сумму:",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel")
+        ]])
+    )
+    return ENTER_AMOUNT
+
+# ── CONVERSATION: ввод суммы ──────────────────────────────
+async def enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(',', '.')
+    try:
+        amount = float(text)
+        if amount <= 0: raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Введи корректную сумму, например: `1500` или `299.90`",
+            parse_mode='Markdown'
+        )
+        return ENTER_AMOUNT
+
+    context.user_data['amount'] = amount
+    tx_type    = context.user_data['tx_type']
+    type_label = "📉 Расход" if tx_type == 'expense' else "📈 Доход"
+
+    await update.message.reply_text(
+        f"*{type_label}* · `{fmt(amount)}`\n\n📂 Выбери категорию:",
+        parse_mode='Markdown',
+        reply_markup=cat_keyboard(tx_type)
+    )
+    return CHOOSE_CATEGORY
+
+# ── CONVERSATION: выбор категории ─────────────────────────
+async def cb_choose_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    cat_name = query.data.split(':', 1)[1]
+
+    if cat_name == '__custom__':
+        await query.edit_message_text(
+            "✏️ Напиши название своей категории:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel")
+            ]])
+        )
+        return ENTER_CUSTOM_CAT
+
+    tx_type = context.user_data['tx_type']
+    cats    = EXPENSE_CATS if tx_type == 'expense' else INCOME_CATS
+    emoji   = next((e for _, n, e in cats if n == cat_name), '💡')
+    context.user_data['category'] = cat_name
+    context.user_data['emoji']    = emoji
+
+    await _show_confirm(query, context)
+    return CHOOSE_CATEGORY
+
+# ── CONVERSATION: своя категория ──────────────────────────
+async def enter_custom_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_name = update.message.text.strip()
+    if not cat_name:
+        await update.message.reply_text("⚠️ Введи название категории:")
+        return ENTER_CUSTOM_CAT
+
+    context.user_data['category'] = cat_name
+    context.user_data['emoji']    = '💡'
+
+    tx_type    = context.user_data['tx_type']
+    amount     = context.user_data['amount']
+    today      = date.today().strftime('%d.%m.%Y')
+    type_label = "📉 Расход" if tx_type == 'expense' else "📈 Доход"
+
+    await update.message.reply_text(
+        f"*{type_label}*\n\n"
+        f"💡 {cat_name}\n"
+        f"💰 `{fmt(amount)}`\n"
+        f"📅 {today}\n\n"
+        f"Всё верно?",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Добавить запись", callback_data="confirm")],
+            [InlineKeyboardButton("❌ Отмена",          callback_data="cancel")],
+        ])
+    )
+    return CHOOSE_CATEGORY
+
+async def _show_confirm(query, context: ContextTypes.DEFAULT_TYPE):
+    tx_type    = context.user_data['tx_type']
+    amount     = context.user_data['amount']
+    category   = context.user_data['category']
+    emoji      = context.user_data['emoji']
+    today      = date.today().strftime('%d.%m.%Y')
+    type_label = "📉 Расход" if tx_type == 'expense' else "📈 Доход"
+
+    await query.edit_message_text(
+        f"*{type_label}*\n\n"
+        f"{emoji} {category}\n"
+        f"💰 `{fmt(amount)}`\n"
+        f"📅 {today}\n\n"
+        f"Всё верно?",
+        parse_mode='Markdown',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Добавить запись", callback_data="confirm")],
+            [InlineKeyboardButton("◀️ Назад",           callback_data=f"back_to_cat")],
+            [InlineKeyboardButton("❌ Отмена",           callback_data="cancel")],
+        ])
+    )
+
+# ── CONVERSATION: назад к категориям ─────────────────────
+async def cb_back_to_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tx_type    = context.user_data.get('tx_type', 'expense')
+    amount     = context.user_data.get('amount', 0)
+    type_label = "📉 Расход" if tx_type == 'expense' else "📈 Доход"
+    await query.edit_message_text(
+        f"*{type_label}* · `{fmt(amount)}`\n\n📂 Выбери категорию:",
+        parse_mode='Markdown',
+        reply_markup=cat_keyboard(tx_type)
+    )
+    return CHOOSE_CATEGORY
+
+# ── CONVERSATION: подтверждение ───────────────────────────
+async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    tg_id = str(query.from_user.id)
+    uid   = get_uid(tg_id)
+    if not uid:
+        await query.edit_message_text("⚠️ Аккаунт не подключён.")
+        return ConversationHandler.END
+
+    tx_type  = context.user_data['tx_type']
+    amount   = context.user_data['amount']
+    category = context.user_data['category']
+    emoji    = context.user_data['emoji']
+    today    = date.today().isoformat()
+    type_label = "📉 Расход" if tx_type == 'expense' else "📈 Доход"
 
     try:
-        txs = db.collection('users').document(uid).collection('transactions').stream()
-        total_inc = total_exp = 0.0
-        for t in txs:
-            d = t.to_dict()
-            if d.get('type') == 'income':
-                total_inc += d.get('amount', 0)
-            else:
-                total_exp += d.get('amount', 0)
+        db.collection('users').document(uid).collection('transactions').add({
+            'type': tx_type, 'amount': amount, 'category': category,
+            'emoji': emoji, 'desc': category, 'date': today,
+            'ts': SERVER_TIMESTAMP,
+        })
+        await query.edit_message_text(
+            f"✅ *{type_label} добавлен!*\n\n"
+            f"{emoji} {category} · `{fmt(amount)}`",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ Ещё запись", callback_data="new_entry"),
+                InlineKeyboardButton("🏠 Меню",       callback_data="menu:main"),
+            ]])
+        )
+    except Exception as e:
+        await query.edit_message_text(f"⚠️ Ошибка: {e}")
 
-        bal = total_inc - total_exp
+    context.user_data.clear()
+    return ConversationHandler.END
+
+# ── CONVERSATION: отмена ──────────────────────────────────
+async def cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    await query.edit_message_text(
+        "Отменено.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Меню", callback_data="menu:main")
+        ]])
+    )
+    return ConversationHandler.END
+
+# ── МЕНЮ-КОЛБЭКИ ─────────────────────────────────────────
+async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query  = update.callback_query
+    await query.answer()
+    action = query.data.split(':')[1]
+    tg_id  = str(query.from_user.id)
+    uid    = get_uid(tg_id)
+    back   = [[InlineKeyboardButton("◀️ Назад в меню", callback_data="menu:main")]]
+
+    if action == 'main':
+        await query.edit_message_text("Что делаем?", reply_markup=main_keyboard())
+        return
+
+    if not uid:
+        await query.edit_message_text("⚠️ Аккаунт не подключён. /start")
+        return
+
+    if action == 'balance':
+        inc = exp = 0.0
+        for t in db.collection('users').document(uid).collection('transactions').stream():
+            d = t.to_dict()
+            if d.get('type') == 'income': inc += d.get('amount', 0)
+            else: exp += d.get('amount', 0)
+        bal  = inc - exp
         sign = '📈' if bal >= 0 else '📉'
-
-        await update.message.reply_text(
-            f"💳 *Баланс*\n\n"
-            f"{sign} *{fmt(bal)}*\n\n"
-            f"↑ Доходы:  `{fmt(total_inc)}`\n"
-            f"↓ Расходы: `{fmt(total_exp)}`",
-            parse_mode='Markdown'
+        await query.edit_message_text(
+            f"💳 *Баланс*\n\n{sign} *{fmt(bal)}*\n\n↑ Доходы:  `{fmt(inc)}`\n↓ Расходы: `{fmt(exp)}`",
+            parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(back)
         )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id)
-    uid = get_uid(tg_id)
-    if not uid:
-        await update.message.reply_text("⚠️ Сначала подключи аккаунт: /start")
-        return
-
-    month = datetime.now().strftime('%Y-%m')
-    try:
-        txs = db.collection('users').document(uid).collection('transactions').stream()
-        cat_map: dict[str, dict] = {}
-        total_inc_m = 0.0
-
-        for t in txs:
+    elif action == 'stat':
+        from datetime import datetime
+        month = datetime.now().strftime('%Y-%m')
+        cats, inc_m = {}, 0.0
+        for t in db.collection('users').document(uid).collection('transactions').stream():
             d = t.to_dict()
-            if not d.get('date', '').startswith(month):
-                continue
-            if d.get('type') == 'income':
-                total_inc_m += d.get('amount', 0)
+            if not d.get('date','').startswith(month): continue
+            if d.get('type') == 'income': inc_m += d.get('amount', 0)
             else:
-                cat = d.get('category', 'Другое')
-                emoji = d.get('emoji', '💡')
-                amt = d.get('amount', 0)
-                if cat not in cat_map:
-                    cat_map[cat] = {'emoji': emoji, 'total': 0.0}
-                cat_map[cat]['total'] += amt
+                cat = d.get('category','Другое')
+                cats.setdefault(cat, {'emoji': d.get('emoji','💡'), 'total': 0.0})
+                cats[cat]['total'] += d.get('amount', 0)
 
-        if not cat_map:
-            await update.message.reply_text(
-                f"📊 В *{month}* расходов пока нет.", parse_mode='Markdown'
-            )
-            return
+        if not cats:
+            await query.edit_message_text(f"📊 В *{month}* расходов пока нет.",
+                parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(back)); return
 
-        sorted_cats = sorted(cat_map.items(), key=lambda x: x[1]['total'], reverse=True)[:5]
-        total_exp_m = sum(v['total'] for _, v in sorted_cats)
-
-        lines = [f"📊 *Расходы за {month}*\n"]
-        for i, (cat, data) in enumerate(sorted_cats, 1):
-            pct = round(data['total'] / total_exp_m * 100) if total_exp_m else 0
+        top      = sorted(cats.items(), key=lambda x: x[1]['total'], reverse=True)[:5]
+        total_e  = sum(v['total'] for _, v in top)
+        lines    = [f"📊 *Расходы за {month}*\n"]
+        for i, (cat, data) in enumerate(top, 1):
+            pct = round(data['total'] / total_e * 100) if total_e else 0
             bar = '█' * (pct // 10) + '░' * (10 - pct // 10)
             lines.append(f"{i}. {data['emoji']} *{cat}*\n    `{bar}` {pct}%  —  `{fmt(data['total'])}`")
+        lines += [f"\n💸 Расходы: `{fmt(total_e)}`", f"💰 Доходы:  `{fmt(inc_m)}`"]
+        await query.edit_message_text('\n'.join(lines), parse_mode='Markdown',
+                                      reply_markup=InlineKeyboardMarkup(back))
 
-        lines.append(f"\n💸 Расходы: `{fmt(total_exp_m)}`")
-        lines.append(f"💰 Доходы:  `{fmt(total_inc_m)}`")
-
-        await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
-
-
-async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id)
-    uid = get_uid(tg_id)
-    if not uid:
-        await update.message.reply_text("⚠️ Сначала подключи аккаунт: /start")
-        return
-
-    try:
-        docs = (
-            db.collection('users').document(uid).collection('transactions')
-            .order_by('ts', direction=firestore.Query.DESCENDING)
-            .limit(5)
-            .stream()
-        )
-        items = list(docs)
-        if not items:
-            await update.message.reply_text("📭 Записей пока нет.")
-            return
-
-        lines = ["📋 *Последние записи:*\n"]
-        for t in items:
-            d = t.to_dict()
-            sign = '↑' if d.get('type') == 'income' else '↓'
-            emoji = d.get('emoji', '💡')
-            amt = fmt(d.get('amount', 0))
-            desc = d.get('desc', '')
-            dt = d.get('date', '')
-            lines.append(f"{sign} {emoji} `{amt}` — {desc} _{dt}_")
-
-        await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
-
-
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = str(update.effective_user.id)
-    uid = get_uid(tg_id)
-    if not uid:
-        await update.message.reply_text("⚠️ Сначала подключи аккаунт: /start")
-        return
-
-    try:
+    elif action == 'last':
         docs = list(
             db.collection('users').document(uid).collection('transactions')
-            .order_by('ts', direction=firestore.Query.DESCENDING)
-            .limit(1)
-            .stream()
+            .order_by('ts', direction=firestore.Query.DESCENDING).limit(5).stream()
         )
         if not docs:
-            await update.message.reply_text("📭 Нет записей для удаления.")
-            return
+            await query.edit_message_text("📭 Записей пока нет.",
+                reply_markup=InlineKeyboardMarkup(back)); return
+        lines = ["📋 *Последние записи:*\n"]
+        for t in docs:
+            d = t.to_dict()
+            sign = '↑' if d.get('type') == 'income' else '↓'
+            lines.append(f"{sign} {d.get('emoji','💡')} `{fmt(d.get('amount',0))}` — {d.get('desc','')} _{d.get('date','')}_")
+        await query.edit_message_text('\n'.join(lines), parse_mode='Markdown',
+                                      reply_markup=InlineKeyboardMarkup(back))
 
-        doc = docs[0]
-        d = doc.to_dict()
-        doc.reference.delete()
-
-        type_word = 'Доход' if d.get('type') == 'income' else 'Расход'
-        emoji = d.get('emoji', '💡')
-        await update.message.reply_text(
-            f"🗑 *{type_word} удалён*\n"
-            f"{emoji} {d.get('category','')} — `{fmt(d.get('amount',0))}`\n"
-            f"📝 {d.get('desc','')}\n"
-            f"📅 {d.get('date','')}",
-            parse_mode='Markdown'
+    elif action == 'delete':
+        docs = list(
+            db.collection('users').document(uid).collection('transactions')
+            .order_by('ts', direction=firestore.Query.DESCENDING).limit(1).stream()
         )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
+        if not docs:
+            await query.edit_message_text("📭 Нет записей.",
+                reply_markup=InlineKeyboardMarkup(back)); return
+        doc = docs[0]; d = doc.to_dict(); doc.reference.delete()
+        type_word = 'Доход' if d.get('type') == 'income' else 'Расход'
+        await query.edit_message_text(
+            f"🗑 *{type_word} удалён*\n{d.get('emoji','💡')} {d.get('category','')} — `{fmt(d.get('amount',0))}`\n📅 {d.get('date','')}",
+            parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(back)
+        )
 
+async def cb_new_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "Выбери тип записи:",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📉 Расход", callback_data="type:expense"),
+                InlineKeyboardButton("📈 Доход",  callback_data="type:income"),
+            ],
+            [InlineKeyboardButton("🏠 Меню", callback_data="menu:main")],
+        ])
+    )
 
 async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = str(update.effective_user.id)
     users = load_users()
-    if tg_id in users:
-        del users[tg_id]
-        save_users(users)
-    await update.message.reply_text(
-        "✅ Аккаунт отвязан.\nИспользуй /start чтобы подключить снова."
-    )
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатываем текстовые сообщения — добавление транзакций."""
-    tg_id = str(update.effective_user.id)
-    uid = get_uid(tg_id)
-
-    if not uid:
-        await update.message.reply_text(
-            "⚠️ Аккаунт не подключён. Отправь /start для настройки."
-        )
-        return
-
-    text = update.message.text.strip()
-
-    # Паттерны парсинга
-    patterns = [
-        # "расход 500 кофе" / "р 1500 такси"
-        (r'^(?:расход|расх|р|expense)\s+([\d\s.,]+)\s*(.*)', 'expense'),
-        # "доход 50000 зарплата" / "д 5000"
-        (r'^(?:доход|дох|д|income)\s+([\d\s.,]+)\s*(.*)', 'income'),
-        # "-500 кофе"
-        (r'^-([\d\s.,]+)\s*(.*)', 'expense'),
-        # "+50000 зарплата"
-        (r'^\+([\d\s.,]+)\s*(.*)', 'income'),
-    ]
-
-    tx_type = None
-    amount = None
-    desc = ''
-
-    for pattern, ptype in patterns:
-        m = re.match(pattern, text, re.IGNORECASE)
-        if m:
-            raw_amt = m.group(1).replace(' ', '').replace(',', '.')
-            try:
-                amount = float(raw_amt)
-            except ValueError:
-                continue
-            desc = m.group(2).strip() if m.lastindex >= 2 else ''
-            tx_type = ptype
-            break
-
-    if tx_type is None:
-        # Не похоже на транзакцию — игнорируем
-        return
-
-    if amount is None or amount <= 0:
-        await update.message.reply_text("⚠️ Некорректная сумма.")
-        return
-
-    category, emoji = detect_category(desc, tx_type)
-    if not desc:
-        desc = category
-
-    today = date.today().isoformat()
-
-    try:
-        db.collection('users').document(uid).collection('transactions').add({
-            'type': tx_type,
-            'amount': amount,
-            'category': category,
-            'emoji': emoji,
-            'desc': desc,
-            'date': today,
-            'ts': SERVER_TIMESTAMP,
-        })
-
-        sign = '↑' if tx_type == 'income' else '↓'
-        type_word = 'Доход' if tx_type == 'income' else 'Расход'
-        await update.message.reply_text(
-            f"✅ *{type_word} добавлен*\n\n"
-            f"{sign} {emoji} *{category}*\n"
-            f"💰 `{fmt(amount)}`\n"
-            f"📝 {desc}\n"
-            f"📅 {today}",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка сохранения: {e}")
-
+    if tg_id in users: del users[tg_id]; save_users(users)
+    await update.message.reply_text("✅ Аккаунт отвязан. /start — подключить снова.")
 
 # ── MAIN ──────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
+    conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(cb_choose_type, pattern=r'^type:')],
+        states={
+            ENTER_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_amount),
+                CallbackQueryHandler(cb_cancel, pattern=r'^cancel$'),
+            ],
+            CHOOSE_CATEGORY: [
+                CallbackQueryHandler(cb_choose_category, pattern=r'^cat:'),
+                CallbackQueryHandler(cb_confirm,         pattern=r'^confirm$'),
+                CallbackQueryHandler(cb_cancel,          pattern=r'^cancel$'),
+                CallbackQueryHandler(cb_back_to_cat,     pattern=r'^back_to_cat$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_custom_cat),
+            ],
+            ENTER_CUSTOM_CAT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, enter_custom_cat),
+                CallbackQueryHandler(cb_cancel, pattern=r'^cancel$'),
+            ],
+        },
+        fallbacks=[CallbackQueryHandler(cb_cancel, pattern=r'^cancel$')],
+        per_message=False,
+    )
+
+    app.add_handler(conv)
     app.add_handler(CommandHandler('start',      cmd_start))
     app.add_handler(CommandHandler('uid',        cmd_uid))
-    app.add_handler(CommandHandler('help',       cmd_help))
-    app.add_handler(CommandHandler('balance',    cmd_balance))
-    app.add_handler(CommandHandler('stat',       cmd_stats))
-    app.add_handler(CommandHandler('last',       cmd_last))
-    app.add_handler(CommandHandler('delete',     cmd_delete))
+    app.add_handler(CommandHandler('menu',       cmd_menu))
     app.add_handler(CommandHandler('disconnect', cmd_disconnect))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(cb_menu,      pattern=r'^menu:'))
+    app.add_handler(CallbackQueryHandler(cb_new_entry, pattern=r'^new_entry$'))
 
     logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == '__main__':
     main()
