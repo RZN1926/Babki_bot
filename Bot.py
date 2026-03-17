@@ -118,13 +118,13 @@ HELP_TEXT = (
     "`доход 50000 зарплата` — доход\n"
     "`-500 такси` или `+5000 фриланс` — быстрый ввод\n\n"
     "*Просмотр:*\n"
-    "/баланс — текущий баланс\n"
-    "/стат — топ расходов за месяц\n"
-    "/последние — последние 5 записей\n\n"
+    "/balance — текущий баланс\n"
+    "/stat — топ расходов за месяц\n"
+    "/last — последние 5 записей\n\n"
     "*Управление:*\n"
-    "/удалить — удалить последнюю запись\n"
-    "/отвязать — отвязать Firebase аккаунт\n"
-    "/помощь — эта справка"
+    "/delete — удалить последнюю запись\n"
+    "/disconnect — отвязать Firebase аккаунт\n"
+    "/help — эта справка"
 )
 
 # ── HANDLERS ──────────────────────────────────────────────
@@ -427,15 +427,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler('start',    cmd_start))
-    app.add_handler(CommandHandler('uid',      cmd_uid))
-    app.add_handler(CommandHandler('help',     cmd_help))
-    app.add_handler(CommandHandler('помощь',   cmd_help))
-    app.add_handler(CommandHandler('баланс',   cmd_balance))
-    app.add_handler(CommandHandler('стат',     cmd_stats))
-    app.add_handler(CommandHandler('последние',cmd_last))
-    app.add_handler(CommandHandler('удалить',  cmd_delete))
-    app.add_handler(CommandHandler('отвязать', cmd_disconnect))
+    app.add_handler(CommandHandler('start',      cmd_start))
+    app.add_handler(CommandHandler('uid',        cmd_uid))
+    app.add_handler(CommandHandler('help',       cmd_help))
+    app.add_handler(CommandHandler('balance',    cmd_balance))
+    app.add_handler(CommandHandler('stat',       cmd_stats))
+    app.add_handler(CommandHandler('last',       cmd_last))
+    app.add_handler(CommandHandler('delete',     cmd_delete))
+    app.add_handler(CommandHandler('disconnect', cmd_disconnect))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Бот запущен!")
