@@ -142,7 +142,7 @@ async def cmd_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_users(users)
     name = update.effective_user.first_name or "друг"
     await update.message.reply_text(
-        f"✅ *Аккаунт подключён!* Привет, *{name}*!\n\nЧто делаем?",
+        f"✅ *Аккаунт подключён!* Приветтттттттттт, *{name}*!\n\nЧто делаем?",
         parse_mode='Markdown',
         reply_markup=main_keyboard()
     )
