@@ -117,7 +117,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Я помогу управлять *личными финансами* прямо из Telegram — "
             "записи мгновенно синхронизируются с твоим веб-приложением.\n\n"
             "🔑 Чтобы начать:\n"
-            "1. Открой сайт → *Меню → Настройки*\n"
+            "1. [Открой сайт](https://rzn1926.github.io/income_calc/) → *Меню → Настройки*\n"
             "2. Скопируй свой *Firebase UID*\n"
             "3. Отправь мне: `/uid ТВОЙ_UID`",
             parse_mode='Markdown'
